@@ -3,7 +3,7 @@
  * MSM architecture cpufreq driver
  *
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2007-2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2007-2016, The Linux Foundation. All rights reserved.
  * Author: Mike A. Chan <mikechan@google.com>
  *
  * This software is licensed under the terms of the GNU General Public
@@ -23,11 +23,14 @@
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/suspend.h>
-#include <linux/clk.h>
+#include <linux/clk/msm-clk-provider.h>
 #include <linux/err.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
 #include <trace/events/power.h>
+#ifdef CONFIG_ARCH_MSM8996
+#include <soc/qcom/socinfo.h>
+#endif
 
 static DEFINE_MUTEX(l2bw_lock);
 
@@ -48,7 +51,7 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 {
 	int ret = 0;
 	struct cpufreq_freqs freqs;
-	unsigned long rate;
+	unsigned long rate = 0L;
 
 	freqs.old = policy->cur;
 	freqs.new = new_freq;
@@ -72,7 +75,7 @@ static int msm_cpufreq_target(struct cpufreq_policy *policy,
 				unsigned int relation)
 {
 	int ret = 0;
-	int index;
+	int index = 0;
 	struct cpufreq_frequency_table *table;
 
 	mutex_lock(&per_cpu(suspend_data, policy->cpu).suspend_mutex);
@@ -126,12 +129,12 @@ static unsigned int msm_cpufreq_get_freq(unsigned int cpu)
 
 static int msm_cpufreq_init(struct cpufreq_policy *policy)
 {
-	int cur_freq;
-	int index;
+	int cur_freq = 0;
+	int index = 0;
 	int ret = 0;
 	struct cpufreq_frequency_table *table =
 			per_cpu(freq_table, policy->cpu);
-	int cpu;
+	int cpu = 0;
 
 	/*
 	 * In some SoC, some cores are clocked by same source, and their
@@ -143,8 +146,11 @@ static int msm_cpufreq_init(struct cpufreq_policy *policy)
 		if (cpu_clk[cpu] == cpu_clk[policy->cpu])
 			cpumask_set_cpu(cpu, policy->cpus);
 
-	if (cpufreq_frequency_table_cpuinfo(policy, table))
+	ret = cpufreq_table_validate_and_show(policy, table);
+	if (ret) {
 		pr_err("cpufreq: failed to get policy min/max\n");
+		return ret;
+	}
 
 	cur_freq = clk_get_rate(cpu_clk[policy->cpu])/1000;
 
@@ -176,7 +182,7 @@ static int msm_cpufreq_cpu_callback(struct notifier_block *nfb,
 		unsigned long action, void *hcpu)
 {
 	unsigned int cpu = (unsigned long)hcpu;
-	int rc;
+	int rc = 0;
 
 	/* Fail hotplug until this driver can get CPU clocks */
 	if (!hotplug_ready)
@@ -235,7 +241,7 @@ static struct notifier_block __refdata msm_cpufreq_cpu_notifier = {
 
 static int msm_cpufreq_suspend(void)
 {
-	int cpu;
+	int cpu = 0;
 
 	for_each_possible_cpu(cpu) {
 		mutex_lock(&per_cpu(suspend_data, cpu).suspend_mutex);
@@ -248,7 +254,7 @@ static int msm_cpufreq_suspend(void)
 
 static int msm_cpufreq_resume(void)
 {
-	int cpu, ret;
+	int cpu = 0, ret = 0;
 	struct cpufreq_policy policy;
 
 	for_each_possible_cpu(cpu) {
@@ -315,12 +321,56 @@ static struct cpufreq_driver msm_cpufreq_driver = {
 	.attr		= msm_freq_attr,
 };
 
+#ifdef CONFIG_ARCH_MSM8996
+/*
+ * Always underclock the power cluster for both MSM8996 and MSM8996pro. There
+ * are reproducible crashes with the AnTuTu CPU multithread test when both
+ * clusters run at their stock maxfreq. Underclocking the power cluster allows
+ * MSM8996 to be stable at its perf cluster's stock maxfreq, and it allows
+ * MSM8996pro to be stable at 2150 MHz on its perf cluster.
+ *
+ * This instability occurs even with a kernel that the OEM compiled.
+ * TODO: Investigate why this happens and find a proper fix that allows use of
+ * all stock frequencies.
+ */
+#define UNDERCLK_MAX_PERFCL_MSM8996PRO	2150400
+#define UNDERCLK_MAX_PWRCL_MSM8996PRO	1516800
+#define UNDERCLK_MAX_PERFCL_MSM8996	1824000
+#define UNDERCLK_MAX_PWRCL_MSM8996	1478400
+static bool no_cpu_underclock;
+
+static int __init get_cpu_underclock(char *unused)
+{
+	no_cpu_underclock = true;
+
+	return 0;
+}
+__setup("no_underclock", get_cpu_underclock);
+#endif
+
 static struct cpufreq_frequency_table *cpufreq_parse_dt(struct device *dev,
 						char *tbl_name, int cpu)
 {
-	int ret, nf, i;
+	int ret = 0, nf = 0, i = 0, j = 0;
 	u32 *data;
 	struct cpufreq_frequency_table *ftbl;
+#ifdef CONFIG_ARCH_MSM8996
+	int underclk_max_perfcl, underclk_max_pwrcl;
+
+	if (socinfo_get_id() == 305) {
+		underclk_max_perfcl = UNDERCLK_MAX_PERFCL_MSM8996PRO;
+		underclk_max_pwrcl = UNDERCLK_MAX_PWRCL_MSM8996PRO;
+		/*
+		 * TODO: Find out why higher freqs on both clusters crash
+		 * MSM8996pro during AnTuTu's CPU multithread test, even with
+		 * the OEM's kernel.
+		 */
+		no_cpu_underclock = false;
+	} else {
+		underclk_max_perfcl = UNDERCLK_MAX_PERFCL_MSM8996;
+		underclk_max_pwrcl = UNDERCLK_MAX_PWRCL_MSM8996;
+	}
+#endif
 
 	/* Parse list of usable CPU frequencies. */
 	if (!of_find_property(dev->of_node, tbl_name, &nf))
@@ -342,6 +392,7 @@ static struct cpufreq_frequency_table *cpufreq_parse_dt(struct device *dev,
 	if (!ftbl)
 		return ERR_PTR(-ENOMEM);
 
+	j = 0;
 	for (i = 0; i < nf; i++) {
 		unsigned long f;
 
@@ -351,29 +402,35 @@ static struct cpufreq_frequency_table *cpufreq_parse_dt(struct device *dev,
 		f /= 1000;
 
 		/*
-		 * Check if this is the last feasible frequency in the table.
+		 * Don't repeat frequencies if they round up to the same clock
+		 * frequency.
 		 *
-		 * The table listing frequencies higher than what the HW can
-		 * support is not an error since the table might be shared
-		 * across CPUs in different speed bins. It's also not
-		 * sufficient to check if the rounded rate is lower than the
-		 * requested rate as it doesn't cover the following example:
-		 *
-		 * Table lists: 2.2 GHz and 2.5 GHz.
-		 * Rounded rate returns: 2.2 GHz and 2.3 GHz.
-		 *
-		 * In this case, we can CPUfreq to use 2.2 GHz and 2.3 GHz
-		 * instead of rejecting the 2.5 GHz table entry.
 		 */
-		if (i > 0 && f <= ftbl[i-1].frequency)
-			break;
+		if (j > 0 && f <= ftbl[j - 1].frequency)
+			continue;
 
-		ftbl[i].driver_data = i;
-		ftbl[i].frequency = f;
+		ftbl[j].driver_data = j;
+		ftbl[j].frequency = f;
+		j++;
+
+#ifdef CONFIG_ARCH_MSM8996
+		/* Always underclock power cluster for stability */
+		if (cpu < 2) {
+			if (f == underclk_max_pwrcl) {
+				i++;
+				break;
+			}
+		} else if (!no_cpu_underclock) {
+			if (f == underclk_max_perfcl) {
+				i++;
+				break;
+			}
+		}
+#endif
 	}
 
-	ftbl[i].driver_data = i;
-	ftbl[i].frequency = CPUFREQ_TABLE_END;
+	ftbl[j].driver_data = j;
+	ftbl[j].frequency = CPUFREQ_TABLE_END;
 
 	devm_kfree(dev, data);
 
@@ -386,7 +443,7 @@ static int __init msm_cpufreq_probe(struct platform_device *pdev)
 	char clk_name[] = "cpu??_clk";
 	char tbl_name[] = "qcom,cpufreq-table-??";
 	struct clk *c;
-	int cpu;
+	int cpu = 0;
 	struct cpufreq_frequency_table *ftbl;
 
 	l2_clk = devm_clk_get(dev, "l2_clk");
@@ -398,6 +455,7 @@ static int __init msm_cpufreq_probe(struct platform_device *pdev)
 		c = devm_clk_get(dev, clk_name);
 		if (IS_ERR(c))
 			return PTR_ERR(c);
+		c->flags |= CLKFLAG_NO_RATE_CACHE;
 		cpu_clk[cpu] = c;
 	}
 	hotplug_ready = true;
@@ -469,7 +527,7 @@ static struct platform_driver msm_cpufreq_plat_driver = {
 
 static int __init msm_cpufreq_register(void)
 {
-	int cpu, rc;
+	int cpu = 0, rc = 0;
 
 	for_each_possible_cpu(cpu) {
 		mutex_init(&(per_cpu(suspend_data, cpu).suspend_mutex));
