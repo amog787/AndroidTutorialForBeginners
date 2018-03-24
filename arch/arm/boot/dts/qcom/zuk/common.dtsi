@@ -360,10 +360,3 @@
 	/delete-node/ nq@28;
 };
 
-&firmware {
-	android {
-		fstab {
-			/delete-node/ vendor;
-		};
-	};
-};
